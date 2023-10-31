@@ -91,7 +91,7 @@ import optim
 import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
-from asr_datamodule import WenetSpeechAsrDataModule
+from asr_datamodule import ReazonSpeechAsrDataModule
 from conformer import Conformer
 from decoder import Decoder
 from joiner import Joiner
@@ -855,10 +855,10 @@ def run(rank, world_size, args):
         )  # allow 4 megabytes per sub-module
         diagnostic = diagnostics.attach_diagnostics(model, opts)
 
-    wenetspeech = WenetSpeechAsrDataModule(args)
+    reazonspeech = ReazonSpeechAsrDataModule(args)
 
-    train_cuts = wenetspeech.train_cuts()
-    valid_cuts = wenetspeech.valid_cuts()
+    train_cuts = reazonspeech.train_cuts()
+    valid_cuts = reazonspeech.valid_cuts()
 
     def remove_short_and_long_utt(c: Cut):
         # Keep only utterances with duration between 1 second and 10 seconds
@@ -899,7 +899,7 @@ def run(rank, world_size, args):
 
     train_cuts = train_cuts.filter(remove_short_and_long_utt)
 
-    valid_dl = wenetspeech.valid_dataloaders(valid_cuts)
+    valid_dl = reazonspeech.valid_dataloaders(valid_cuts)
 
     if params.start_batch > 0 and checkpoints and "sampler" in checkpoints:
         # We only load the sampler's state dict when it loads a checkpoint
@@ -908,7 +908,7 @@ def run(rank, world_size, args):
     else:
         sampler_state_dict = None
 
-    train_dl = wenetspeech.train_dataloaders(
+    train_dl = reazonspeech.train_dataloaders(
         train_cuts, sampler_state_dict=sampler_state_dict
     )
 
@@ -1046,7 +1046,7 @@ def scan_pessimistic_batches_for_oom(
 
 def main():
     parser = get_parser()
-    WenetSpeechAsrDataModule.add_arguments(parser)
+    ReazonSpeechAsrDataModule.add_arguments(parser)
     args = parser.parse_args()
     args.lang_dir = Path(args.lang_dir)
     args.exp_dir = Path(args.exp_dir)
