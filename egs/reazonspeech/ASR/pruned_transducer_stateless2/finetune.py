@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-# Copyright    2021  Xiaomi Corp.        (authors: Fangjun Kuang,
-#                                                  Wei Kang
-#                                                  Mingshuang Luo)
+# Copyright    2021-2022  Xiaomi Corp.        (authors: Xiaoyu Yang,
 #
 # See ../../../../LICENSE for clarification regarding multiple authors
 #
@@ -19,83 +17,36 @@
 """
 Usage:
 
-For training with the L subset:
+export CUDA_VISIBLE_DEVICES="0,1,2,3"
 
-export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
-
-./pruned_transducer_stateless2/train.py \
-  --lang-dir data/lang_char \
+./pruned_transducer_stateless2/finetune.py \
+  --world-size 4 \
+  --num-epochs 30 \
+  --start-epoch 1 \
   --exp-dir pruned_transducer_stateless2/exp \
-  --world-size 8 \
-  --num-epochs 15 \
-  --start-epoch 0 \
-  --max-duration 180 \
-  --valid-interval 3000 \
-  --model-warm-step 3000 \
-  --save-every-n 8000 \
-  --training-subset L
+  --full-libri 1 \
+  --do-finetune 1 \
+  --max-duration 100
 
-# For mix precision training:
-
-./pruned_transducer_stateless2/train.py \
-  --lang-dir data/lang_char \
-  --exp-dir pruned_transducer_stateless2/exp \
-  --world-size 8 \
-  --num-epochs 10 \
-  --start-epoch 0 \
-  --max-duration 180 \
-  --valid-interval 3000 \
-  --model-warm-step 3000 \
-  --save-every-n 8000 \
-  --use-fp16 True \
-  --training-subset L
-
-For training with the M subset:
-
-./pruned_transducer_stateless2/train.py \
-  --lang-dir data/lang_char \
-  --exp-dir pruned_transducer_stateless2/exp \
-  --world-size 8 \
-  --num-epochs 29 \
-  --start-epoch 0 \
-  --max-duration 180 \
-  --valid-interval 1000 \
-  --model-warm-step 500 \
-  --save-every-n 1000 \
-  --training-subset M
-
-For training with the S subset:
-
-./pruned_transducer_stateless2/train.py \
-  --lang-dir data/lang_char \
-  --exp-dir pruned_transducer_stateless2/exp \
-  --world-size 8 \
-  --num-epochs 29 \
-  --start-epoch 0 \
-  --max-duration 180 \
-  --valid-interval 400 \
-  --model-warm-step 100 \
-  --save-every-n 1000 \
-  --training-subset S
 """
+
 
 import argparse
 import logging
 import warnings
 from pathlib import Path
 from shutil import copyfile
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import k2
 import optim
 import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
-from asr_datamodule import WenetSpeechAsrDataModule
+from aishell import AishellAsrDataModule
 from conformer import Conformer
 from decoder import Decoder
 from joiner import Joiner
-from lhotse.cut import Cut
 from lhotse.dataset.sampling.base import CutSampler
 from lhotse.utils import fix_random_seed
 from model import Transducer
@@ -116,6 +67,31 @@ from icefall.lexicon import Lexicon
 from icefall.utils import AttributeDict, MetricsTracker, setup_logger, str2bool
 
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
+
+
+def add_finetune_arguments(parser: argparse.ArgumentParser):
+    parser.add_argument("--do-finetune", type=str2bool, default=False)
+
+    parser.add_argument(
+        "--init-modules",
+        type=str,
+        default=None,
+        help="""
+        Modules to be initialized. It matches all parameters starting with
+        a specific key. The keys are given with Comma separated. If None,
+        all modules will be initialised. For example, if you only want to
+        initialise all parameters staring with "encoder", use "encoder";
+        if you want to initialise parameters starting with encoder or decoder,
+        use "encoder,joiner".
+        """,
+    )
+
+    parser.add_argument(
+        "--finetune-ckpt",
+        type=str,
+        default=None,
+        help="Fine-tuning from which checkpoint (a path to a .pt file)",
+    )
 
 
 def get_parser():
@@ -193,30 +169,36 @@ def get_parser():
     parser.add_argument(
         "--initial-lr",
         type=float,
-        default=0.003,
+        default=0.0001,
         help="The initial learning rate.  This value should not need to be changed.",
     )
 
     parser.add_argument(
         "--lr-batches",
         type=float,
-        default=5000,
-        help="""Number of steps that affects how rapidly the learning rate decreases.
-        We suggest not to change this.""",
+        default=100000,
+        help="""Number of steps that affects how rapidly the learning rate
+        decreases. During fine-tuning, we set this very large so that the
+        learning rate slowly decays with number of batches. You may tune
+        its value by yourself.
+        """,
     )
 
     parser.add_argument(
         "--lr-epochs",
         type=float,
-        default=6,
-        help="""Number of epochs that affects how rapidly the learning rate decreases.
+        default=100,
+        help="""Number of epochs that affects how rapidly the learning rate
+        decreases. During fine-tuning, we set this very large so that the
+        learning rate slowly decays with number of batches. You may tune
+        its value by yourself.
         """,
     )
 
     parser.add_argument(
         "--context-size",
         type=int,
-        default=2,
+        default=1,
         help="The context size in the decoder. 1 means bigram; 2 means tri-gram",
     )
 
@@ -270,7 +252,7 @@ def get_parser():
     parser.add_argument(
         "--save-every-n",
         type=int,
-        default=8000,
+        default=2000,
         help="""Save checkpoint after processing this number of batches"
         periodically. We save checkpoint to exp-dir/ whenever
         params.batch_idx_train % save_every_n == 0. The checkpoint filename
@@ -484,6 +466,53 @@ def load_checkpoint_if_available(
     return saved_params
 
 
+def load_model_params(
+    ckpt: str, model: nn.Module, init_modules: List[str] = None, strict: bool = True
+):
+    """Load model params from checkpoint
+
+    Args:
+        ckpt (str): Path to the checkpoint
+        model (nn.Module): model to be loaded
+
+    """
+    logging.info(f"Loading checkpoint from {ckpt}")
+    checkpoint = torch.load(ckpt, map_location="cpu")
+
+    # if module list is empty, load the whole model from ckpt
+    if not init_modules:
+        if next(iter(checkpoint["model"])).startswith("module."):
+            logging.info("Loading checkpoint saved by DDP")
+
+            dst_state_dict = model.state_dict()
+            src_state_dict = checkpoint["model"]
+            for key in dst_state_dict.keys():
+                src_key = "{}.{}".format("module", key)
+                dst_state_dict[key] = src_state_dict.pop(src_key)
+            assert len(src_state_dict) == 0
+            model.load_state_dict(dst_state_dict, strict=strict)
+        else:
+            model.load_state_dict(checkpoint["model"], strict=strict)
+    else:
+        src_state_dict = checkpoint["model"]
+        dst_state_dict = model.state_dict()
+        for module in init_modules:
+            logging.info(f"Loading parameters starting with prefix {module}")
+            src_keys = [
+                k for k in src_state_dict.keys() if k.startswith(module.strip() + ".")
+            ]
+            dst_keys = [
+                k for k in dst_state_dict.keys() if k.startswith(module.strip() + ".")
+            ]
+            assert set(src_keys) == set(dst_keys)  # two sets should match exactly
+            for key in src_keys:
+                dst_state_dict[key] = src_state_dict.pop(key)
+
+        model.load_state_dict(dst_state_dict, strict=strict)
+
+    return None
+
+
 def save_checkpoint(
     params: AttributeDict,
     model: nn.Module,
@@ -494,6 +523,7 @@ def save_checkpoint(
     rank: int = 0,
 ) -> None:
     """Save model, optimizer, scheduler and training stats to file.
+
     Args:
       params:
         It is returned by :func:`get_params`.
@@ -538,12 +568,13 @@ def compute_loss(
     warmup: float = 1.0,
 ) -> Tuple[Tensor, MetricsTracker]:
     """
-    Compute RNN-T loss given the model and its inputs.
+    Compute transducer loss given the model and its inputs.
+
     Args:
       params:
         Parameters for training. See :func:`get_params`.
       model:
-        The model for training. It is an instance of Conformer in our case.
+        The model for training. It is an instance of Zipformer in our case.
       batch:
         A batch of data. See `lhotse.dataset.K2SpeechRecognitionDataset()`
         for the content in it.
@@ -707,7 +738,7 @@ def train_one_epoch(
             scaler.update()
             optimizer.zero_grad()
         except:  # noqa
-            display_and_save_batch(batch, params=params)
+            display_and_save_batch(batch, params=params, graph_compiler=graph_compiler)
             raise
 
         if params.print_diagnostics and batch_idx == 5:
@@ -753,7 +784,7 @@ def train_one_epoch(
                 )
                 tot_loss.write_summary(tb_writer, "train/tot_", params.batch_idx_train)
 
-        if batch_idx > 0 and batch_idx % params.valid_interval == 0:
+        if batch_idx % params.valid_interval == 0 and not params.print_diagnostics:
             logging.info("Computing validation loss")
             valid_info = compute_validation_loss(
                 params=params,
@@ -825,7 +856,15 @@ def run(rank, world_size, args):
     num_param = sum([p.numel() for p in model.parameters()])
     logging.info(f"Number of model parameters: {num_param}")
 
-    checkpoints = load_checkpoint_if_available(params=params, model=model)
+    # load model parameters for model fine-tuning
+    if params.do_finetune:
+        modules = params.init_modules.split(",") if params.init_modules else None
+        checkpoints = load_model_params(
+            ckpt=params.finetune_ckpt, model=model, init_modules=modules
+        )
+    else:
+        assert params.start_epoch > 0, params.start_epoch
+        checkpoints = load_checkpoint_if_available(params=params, model=model)
 
     model.to(device)
     if world_size > 1:
@@ -855,64 +894,11 @@ def run(rank, world_size, args):
         )  # allow 4 megabytes per sub-module
         diagnostic = diagnostics.attach_diagnostics(model, opts)
 
-    wenetspeech = WenetSpeechAsrDataModule(args)
+    aishell = AishellAsrDataModule(args)
+    train_dl = aishell.train_dataloaders(aishell.train_cuts())
+    valid_dl = aishell.valid_dataloaders(aishell.valid_cuts())
 
-    train_cuts = wenetspeech.train_cuts()
-    valid_cuts = wenetspeech.valid_cuts()
-
-    def remove_short_and_long_utt(c: Cut):
-        # Keep only utterances with duration between 1 second and 10 seconds
-        #
-        # Caution: There is a reason to select 10.0 here. Please see
-        # ../local/display_manifest_statistics.py
-        #
-        # You should use ../local/display_manifest_statistics.py to get
-        # an utterance duration distribution for your dataset to select
-        # the threshold
-        if c.duration < 1.0 or c.duration > 10.0:
-            logging.warning(
-                f"Exclude cut with ID {c.id} from training. Duration: {c.duration}"
-            )
-            return False
-
-        # In pruned RNN-T, we require that T >= S
-        # where T is the number of feature frames after subsampling
-        # and S is the number of tokens in the utterance
-
-        # In ./conformer.py, the conv module uses the following expression
-        # for subsampling
-        T = ((c.num_frames - 1) // 2 - 1) // 2
-        tokens = c.supervisions[0].text.replace(" ", "")
-
-        if T < len(tokens):
-            logging.warning(
-                f"Exclude cut with ID {c.id} from training. "
-                f"Number of frames (before subsampling): {c.num_frames}. "
-                f"Number of frames (after subsampling): {T}. "
-                f"Text: {c.supervisions[0].text}. "
-                f"Tokens: {tokens}. "
-                f"Number of tokens: {len(tokens)}"
-            )
-            return False
-
-        return True
-
-    train_cuts = train_cuts.filter(remove_short_and_long_utt)
-
-    valid_dl = wenetspeech.valid_dataloaders(valid_cuts)
-
-    if params.start_batch > 0 and checkpoints and "sampler" in checkpoints:
-        # We only load the sampler's state dict when it loads a checkpoint
-        # saved in the middle of an epoch
-        sampler_state_dict = checkpoints["sampler"]
-    else:
-        sampler_state_dict = None
-
-    train_dl = wenetspeech.train_dataloaders(
-        train_cuts, sampler_state_dict=sampler_state_dict
-    )
-
-    if not params.print_diagnostics and params.start_batch == 0:
+    if not params.print_diagnostics:
         scan_pessimistic_batches_for_oom(
             model=model,
             train_dl=train_dl,
@@ -926,10 +912,10 @@ def run(rank, world_size, args):
         logging.info("Loading grad scaler state dict")
         scaler.load_state_dict(checkpoints["grad_scaler"])
 
-    for epoch in range(params.start_epoch, params.num_epochs):
-        scheduler.step_epoch(epoch)
-        fix_random_seed(params.seed + epoch)
-        train_dl.sampler.set_epoch(epoch)
+    for epoch in range(params.start_epoch, params.num_epochs + 1):
+        scheduler.step_epoch(epoch - 1)
+        fix_random_seed(params.seed + epoch - 1)
+        train_dl.sampler.set_epoch(epoch - 1)
 
         if tb_writer is not None:
             tb_writer.add_scalar("train/epoch", epoch, params.batch_idx_train)
@@ -960,7 +946,6 @@ def run(rank, world_size, args):
             optimizer=optimizer,
             scheduler=scheduler,
             sampler=train_dl.sampler,
-            scaler=scaler,
             rank=rank,
         )
 
@@ -974,6 +959,7 @@ def run(rank, world_size, args):
 def display_and_save_batch(
     batch: dict,
     params: AttributeDict,
+    graph_compiler: CharCtcTrainingGraphCompiler,
 ) -> None:
     """Display the batch statistics and save the batch into disk.
 
@@ -990,18 +976,18 @@ def display_and_save_batch(
     logging.info(f"Saving batch to {filename}")
     torch.save(batch, filename)
 
+    supervisions = batch["supervisions"]
     features = batch["inputs"]
 
     logging.info(f"features shape: {features.shape}")
 
-    texts = batch["supervisions"]["text"]
-    num_tokens = sum(len(i) for i in texts)
-
+    y = graph_compiler.texts_to_ids(supervisions["text"])
+    num_tokens = sum(len(i) for i in y)
     logging.info(f"num tokens: {num_tokens}")
 
 
 def scan_pessimistic_batches_for_oom(
-    model: nn.Module,
+    model: Union[nn.Module, DDP],
     train_dl: torch.utils.data.DataLoader,
     optimizer: torch.optim.Optimizer,
     graph_compiler: CharCtcTrainingGraphCompiler,
@@ -1010,7 +996,7 @@ def scan_pessimistic_batches_for_oom(
     from lhotse.dataset import find_pessimistic_batches
 
     logging.info(
-        "Sanity check -- see if any of the batches in epoch 0 would cause OOM."
+        "Sanity check -- see if any of the batches in epoch 1 would cause OOM."
     )
     batches, crit_values = find_pessimistic_batches(train_dl.sampler)
     for criterion, cuts in batches.items():
@@ -1026,12 +1012,12 @@ def scan_pessimistic_batches_for_oom(
                     graph_compiler=graph_compiler,
                     batch=batch,
                     is_training=True,
-                    warmup=0.0,
+                    warmup=0.0 if params.start_epoch == 1 else 1.0,
                 )
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
-        except RuntimeError as e:
+        except Exception as e:
             if "CUDA out of memory" in str(e):
                 logging.error(
                     "Your GPU ran out of memory with the current "
@@ -1040,15 +1026,17 @@ def scan_pessimistic_batches_for_oom(
                     f"Failing criterion: {criterion} "
                     f"(={crit_values[criterion]}) ..."
                 )
-            display_and_save_batch(batch, params=params)
+            display_and_save_batch(batch, params=params, graph_compiler=graph_compiler)
             raise
 
 
 def main():
     parser = get_parser()
-    WenetSpeechAsrDataModule.add_arguments(parser)
+    AishellAsrDataModule.add_arguments(
+        parser
+    )  # you may replace this with your own dataset
+    add_finetune_arguments(parser)
     args = parser.parse_args()
-    args.lang_dir = Path(args.lang_dir)
     args.exp_dir = Path(args.exp_dir)
 
     world_size = args.world_size

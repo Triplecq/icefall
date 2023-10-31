@@ -1,4 +1,5 @@
 # Copyright      2021  Piotr Żelasko
+# Copyright      2022  Xiaomi Corporation     (Author: Mingshuang Luo)
 #
 # See ../../../../LICENSE for clarification regarding multiple authors
 #
@@ -22,15 +23,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import torch
-from lhotse import (
-    CutSet,
-    Fbank,
-    FbankConfig,
-    load_manifest,
-    load_manifest_lazy,
-    set_caching_enabled,
-)
+from lhotse import CutSet, Fbank, FbankConfig, load_manifest, load_manifest_lazy
 from lhotse.dataset import (
     CutConcatenate,
     CutMix,
@@ -41,26 +34,18 @@ from lhotse.dataset import (
     SpecAugment,
 )
 from lhotse.dataset.input_strategies import OnTheFlyFeatures
-from lhotse.utils import fix_random_seed
 from torch.utils.data import DataLoader
 
 from icefall.utils import str2bool
 
 
-class _SeedWorkers:
-    def __init__(self, seed: int):
-        self.seed = seed
-
-    def __call__(self, worker_id: int):
-        fix_random_seed(self.seed + worker_id)
-
-
-class ReazonSpeechAsrDataModule:
+class AishellAsrDataModule:
     """
     DataModule for k2 ASR experiments.
     It assumes there is always one train and valid dataloader,
     but there can be multiple test dataloaders (e.g. LibriSpeech test-clean
     and test-other).
+
     It contains all the common data pipeline modules used in ASR
     experiments, e.g.:
     - dynamic batch size,
@@ -68,6 +53,7 @@ class ReazonSpeechAsrDataModule:
     - cut concatenation,
     - augmentation,
     - on-the-fly feature extraction
+
     This class should be derived for specific corpora used in ASR tasks.
     """
 
@@ -148,6 +134,12 @@ class ReazonSpeechAsrDataModule:
             "shuffled for each epoch.",
         )
         group.add_argument(
+            "--drop-last",
+            type=str2bool,
+            default=True,
+            help="Whether to drop last batch. Used by sampler.",
+        )
+        group.add_argument(
             "--return-cuts",
             type=str2bool,
             default=True,
@@ -181,18 +173,16 @@ class ReazonSpeechAsrDataModule:
             "A value less than 1 means to disable time warp.",
         )
 
-        # group.add_argument(
-        #     "--enable-musan",
-        #     type=str2bool,
-        #     default=True,
-        #     help="When enabled, select noise from MUSAN and mix it"
-        #     "with training dataset. ",
-        # )
+        group.add_argument(
+            "--enable-musan",
+            type=str2bool,
+            default=True,
+            help="When enabled, select noise from MUSAN and mix it"
+            "with training dataset. ",
+        )
 
     def train_dataloaders(
-        self,
-        cuts_train: CutSet,
-        sampler_state_dict: Optional[Dict[str, Any]] = None,
+        self, cuts_train: CutSet, sampler_state_dict: Optional[Dict[str, Any]] = None
     ) -> DataLoader:
         """
         Args:
@@ -201,17 +191,17 @@ class ReazonSpeechAsrDataModule:
           sampler_state_dict:
             The state dict for the training sampler.
         """
-        # logging.info("About to get Musan cuts")
-        # cuts_musan = load_manifest(self.args.manifest_dir / "musan_cuts.jsonl.gz")
+        logging.info("About to get Musan cuts")
+        cuts_musan = load_manifest(self.args.manifest_dir / "musan_cuts.jsonl.gz")
 
         transforms = []
-        # if self.args.enable_musan:
-        #     logging.info("Enable MUSAN")
-        #     transforms.append(
-        #         CutMix(cuts=cuts_musan, p=0.5, snr=(10, 20), preserve_id=True)
-        #     )
-        # else:
-        #     logging.info("Disable MUSAN")
+        if self.args.enable_musan:
+            logging.info("Enable MUSAN")
+            transforms.append(
+                CutMix(cuts=cuts_musan, p=0.5, snr=(10, 20), preserve_id=True)
+            )
+        else:
+            logging.info("Disable MUSAN")
 
         if self.args.concatenate_cuts:
             logging.info(
@@ -285,8 +275,7 @@ class ReazonSpeechAsrDataModule:
                 max_duration=self.args.max_duration,
                 shuffle=self.args.shuffle,
                 num_buckets=self.args.num_buckets,
-                buffer_size=300000,
-                drop_last=True,
+                drop_last=self.args.drop_last,
             )
         else:
             logging.info("Using SimpleCutSampler.")
@@ -297,10 +286,9 @@ class ReazonSpeechAsrDataModule:
             )
         logging.info("About to create train dataloader")
 
-        # 'seed' is derived from the current random state, which will have
-        # previously been set in the main process.
-        seed = torch.randint(0, 100000, ()).item()
-        worker_init_fn = _SeedWorkers(seed)
+        if sampler_state_dict is not None:
+            logging.info("Loading sampler state dict")
+            train_sampler.load_state_dict(sampler_state_dict)
 
         train_dl = DataLoader(
             train,
@@ -308,12 +296,7 @@ class ReazonSpeechAsrDataModule:
             batch_size=None,
             num_workers=self.args.num_workers,
             persistent_workers=False,
-            worker_init_fn=worker_init_fn,
         )
-
-        if sampler_state_dict is not None:
-            logging.info("Loading sampler state dict")
-            train_dl.sampler.load_state_dict(sampler_state_dict)
 
         return train_dl
 
@@ -338,19 +321,17 @@ class ReazonSpeechAsrDataModule:
                 cut_transforms=transforms,
                 return_cuts=self.args.return_cuts,
             )
-
         valid_sampler = DynamicBucketingSampler(
             cuts_valid,
             max_duration=self.args.max_duration,
             shuffle=False,
         )
         logging.info("About to create dev dataloader")
-
         valid_dl = DataLoader(
             validate,
-            batch_size=None,
             sampler=valid_sampler,
-            num_workers=self.args.num_workers,
+            batch_size=None,
+            num_workers=2,
             persistent_workers=False,
         )
 
@@ -369,7 +350,6 @@ class ReazonSpeechAsrDataModule:
             max_duration=self.args.max_duration,
             shuffle=False,
         )
-
         test_dl = DataLoader(
             test,
             batch_size=None,
@@ -381,14 +361,17 @@ class ReazonSpeechAsrDataModule:
     @lru_cache()
     def train_cuts(self) -> CutSet:
         logging.info("About to get train cuts")
-        return load_manifest_lazy(self.args.manifest_dir / "cuts_train.jsonl.gz")
+        cuts_train = load_manifest_lazy(
+            self.args.manifest_dir / "aishell_cuts_train.jsonl.gz"
+        )
+        return cuts_train
 
     @lru_cache()
     def valid_cuts(self) -> CutSet:
         logging.info("About to get dev cuts")
-        return load_manifest_lazy(self.args.manifest_dir / "cuts_dev.jsonl.gz")
+        return load_manifest_lazy(self.args.manifest_dir / "aishell_cuts_dev.jsonl.gz")
 
     @lru_cache()
-    def test_net_cuts(self) -> List[CutSet]:
+    def test_cuts(self) -> List[CutSet]:
         logging.info("About to get test cuts")
-        return load_manifest_lazy(self.args.manifest_dir / "cuts_test.jsonl.gz")
+        return load_manifest_lazy(self.args.manifest_dir / "aishell_cuts_test.jsonl.gz")
