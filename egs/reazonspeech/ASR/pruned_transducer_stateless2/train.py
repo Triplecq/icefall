@@ -805,7 +805,7 @@ def run(rank, world_size, args):
         device = torch.device("cuda", rank)
     logging.info(f"Device: {device}")
 
-    sp = Tokenizer.load(args.lang, args.lang_type)
+    sp = Tokenizer.load(args.lang_dir, args.lang_type)
 
     # <blk> is defined in local/prepare_lang_char.py
     params.blank_id = sp.piece_to_id("<blk>")
