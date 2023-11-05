@@ -100,13 +100,14 @@ from lhotse.dataset.sampling.base import CutSampler
 from lhotse.utils import fix_random_seed
 from model import Transducer
 from optim import Eden, Eve
+from tokenizer import Tokenizer
 from torch import Tensor
 from torch.cuda.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 
 from icefall import diagnostics
-from icefall.char_graph_compiler import CharCtcTrainingGraphCompiler
+# from icefall.char_graph_compiler import CharCtcTrainingGraphCompiler
 from icefall.checkpoint import load_checkpoint, remove_checkpoints
 from icefall.checkpoint import save_checkpoint as save_checkpoint_impl
 from icefall.checkpoint import save_checkpoint_with_global_batch_idx
@@ -532,7 +533,7 @@ def save_checkpoint(
 def compute_loss(
     params: AttributeDict,
     model: nn.Module,
-    graph_compiler: CharCtcTrainingGraphCompiler,
+    sp: Tokenizer,
     batch: dict,
     is_training: bool,
     warmup: float = 1.0,
@@ -564,12 +565,8 @@ def compute_loss(
     feature_lens = supervisions["num_frames"].to(device)
 
     texts = batch["supervisions"]["text"]
-
-    y = graph_compiler.texts_to_ids(texts)
-    if isinstance(y, list):
-        y = k2.RaggedTensor(y).to(device)
-    else:
-        y = y.to(device)
+    y = sp.encode(texts, out_type=int)
+    y = k2.RaggedTensor(y).to(device)
 
     with torch.set_grad_enabled(is_training):
         simple_loss, pruned_loss = model(
@@ -607,7 +604,7 @@ def compute_loss(
 def compute_validation_loss(
     params: AttributeDict,
     model: nn.Module,
-    graph_compiler: CharCtcTrainingGraphCompiler,
+    sp: Tokenizer,
     valid_dl: torch.utils.data.DataLoader,
     world_size: int = 1,
 ) -> MetricsTracker:
@@ -620,7 +617,7 @@ def compute_validation_loss(
         loss, loss_info = compute_loss(
             params=params,
             model=model,
-            graph_compiler=graph_compiler,
+            sp=sp,
             batch=batch,
             is_training=False,
         )
@@ -643,7 +640,7 @@ def train_one_epoch(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
     scheduler: LRSchedulerType,
-    graph_compiler: CharCtcTrainingGraphCompiler,
+    sp: Tokenizer,
     train_dl: torch.utils.data.DataLoader,
     valid_dl: torch.utils.data.DataLoader,
     scaler: GradScaler,
@@ -691,7 +688,7 @@ def train_one_epoch(
                 loss, loss_info = compute_loss(
                     params=params,
                     model=model,
-                    graph_compiler=graph_compiler,
+                    sp=sp,
                     batch=batch,
                     is_training=True,
                     warmup=(params.batch_idx_train / params.model_warm_step),
@@ -758,7 +755,7 @@ def train_one_epoch(
             valid_info = compute_validation_loss(
                 params=params,
                 model=model,
-                graph_compiler=graph_compiler,
+                sp=sp,
                 valid_dl=valid_dl,
                 world_size=world_size,
             )
@@ -808,14 +805,11 @@ def run(rank, world_size, args):
         device = torch.device("cuda", rank)
     logging.info(f"Device: {device}")
 
-    lexicon = Lexicon(params.lang_dir)
-    graph_compiler = CharCtcTrainingGraphCompiler(
-        lexicon=lexicon,
-        device=device,
-    )
+    sp = Tokenizer.load(args.lang, args.lang_type)
 
-    params.blank_id = lexicon.token_table["<blk>"]
-    params.vocab_size = max(lexicon.tokens) + 1
+    # <blk> is defined in local/prepare_lang_char.py
+    params.blank_id = sp.piece_to_id("<blk>")
+    params.vocab_size = sp.get_piece_size()
 
     logging.info(params)
 
@@ -917,7 +911,7 @@ def run(rank, world_size, args):
             model=model,
             train_dl=train_dl,
             optimizer=optimizer,
-            graph_compiler=graph_compiler,
+            sp=sp,
             params=params,
         )
 
@@ -941,7 +935,7 @@ def run(rank, world_size, args):
             model=model,
             optimizer=optimizer,
             scheduler=scheduler,
-            graph_compiler=graph_compiler,
+            sp=sp,
             train_dl=train_dl,
             valid_dl=valid_dl,
             scaler=scaler,
@@ -1004,7 +998,7 @@ def scan_pessimistic_batches_for_oom(
     model: nn.Module,
     train_dl: torch.utils.data.DataLoader,
     optimizer: torch.optim.Optimizer,
-    graph_compiler: CharCtcTrainingGraphCompiler,
+    sp: Tokenizer,
     params: AttributeDict,
 ):
     from lhotse.dataset import find_pessimistic_batches
@@ -1023,7 +1017,7 @@ def scan_pessimistic_batches_for_oom(
                 loss, _ = compute_loss(
                     params=params,
                     model=model,
-                    graph_compiler=graph_compiler,
+                    sp=sp,
                     batch=batch,
                     is_training=True,
                     warmup=0.0,
@@ -1047,6 +1041,7 @@ def scan_pessimistic_batches_for_oom(
 def main():
     parser = get_parser()
     ReazonSpeechAsrDataModule.add_arguments(parser)
+    Tokenizer.add_arguments(parser)
     args = parser.parse_args()
     args.lang_dir = Path(args.lang_dir)
     args.exp_dir = Path(args.exp_dir)
