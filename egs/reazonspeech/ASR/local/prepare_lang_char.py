@@ -75,7 +75,7 @@ def main():
         if "_sp" in cut.id:
             continue
 
-        text: str = cut.supervisions[0].custom["raw"]
+        text: str = cut.supervisions[0].text
         for w in parser.parse(text, sep=" ").split(" "):
             token_set.update(w)
 
