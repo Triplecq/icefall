@@ -855,15 +855,15 @@ def run(rank, world_size, args):
     valid_cuts = reazonspeech.valid_cuts()
 
     def remove_short_and_long_utt(c: Cut):
-        # Keep only utterances with duration between 1 second and 10 seconds
+        # Keep only utterances with duration between 1 second and 25 seconds
         #
-        # Caution: There is a reason to select 10.0 here. Please see
+        # Caution: There is a reason to select 25.0 here. Please see
         # ../local/display_manifest_statistics.py
         #
         # You should use ../local/display_manifest_statistics.py to get
         # an utterance duration distribution for your dataset to select
         # the threshold
-        if c.duration < 1.0 or c.duration > 10.0:
+        if c.duration < 1.0 or c.duration > 25.0:
             logging.warning(
                 f"Exclude cut with ID {c.id} from training. Duration: {c.duration}"
             )
