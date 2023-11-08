@@ -100,7 +100,7 @@ from typing import Dict, List, Optional, Tuple
 import k2
 import torch
 import torch.nn as nn
-from asr_datamodule import WenetSpeechAsrDataModule
+from asr_datamodule import ReazonSpeechAsrDataModule
 from beam_search import (
     beam_search,
     fast_beam_search_nbest,
@@ -112,10 +112,9 @@ from beam_search import (
     modified_beam_search,
 )
 from train import get_params, get_transducer_model
+from tokenizer import Tokenizer
 
-from icefall.char_graph_compiler import CharCtcTrainingGraphCompiler
 from icefall.checkpoint import average_checkpoints, find_checkpoints, load_checkpoint
-from icefall.lexicon import Lexicon
 from icefall.utils import (
     AttributeDict,
     setup_logger,
@@ -282,9 +281,9 @@ def get_parser():
 def decode_one_batch(
     params: AttributeDict,
     model: nn.Module,
-    lexicon: Lexicon,
-    graph_compiler: CharCtcTrainingGraphCompiler,
+    sp: Tokenizer,
     batch: dict,
+    word_talbe: Optional[k2.SymbolTable] = None,
     decoding_graph: Optional[k2.Fsa] = None,
 ) -> Dict[str, List[List[str]]]:
     """Decode one batch and return the result in a dict. The dict has the
@@ -302,10 +301,14 @@ def decode_one_batch(
         It's the return value of :func:`get_params`.
       model:
         The neural model.
+      sp:
+        The BPE model.
       batch:
         It is the return value from iterating
         `lhotse.dataset.K2SpeechRecognitionDataset`. See its documentation
         for the format of the `batch`.
+      word_table:
+        The word symbol table.
       decoding_graph:
         The decoding graph. Can be either a `k2.trivial_graph` or HLG, Used
         only when --decoding_method is fast_beam_search.
@@ -336,8 +339,8 @@ def decode_one_batch(
             max_contexts=params.max_contexts,
             max_states=params.max_states,
         )
-        for i in range(encoder_out.size(0)):
-            hyps.append([lexicon.token_table[idx] for idx in hyp_tokens[i]])
+        for hyp in sp.decode(hyp_tokens):
+            hyps.append(sp.text2word(hyp))
     elif params.decoding_method == "fast_beam_search_nbest_LG":
         hyp_tokens = fast_beam_search_nbest_LG(
             model=model,
@@ -351,8 +354,7 @@ def decode_one_batch(
             nbest_scale=params.nbest_scale,
         )
         for hyp in hyp_tokens:
-            sentence = "".join([lexicon.word_table[i] for i in hyp])
-            hyps.append(list(sentence))
+            hyps.append([word_talbe[i] for i in hyp])
     elif params.decoding_method == "fast_beam_search_nbest":
         hyp_tokens = fast_beam_search_nbest(
             model=model,
@@ -365,8 +367,8 @@ def decode_one_batch(
             num_paths=params.num_paths,
             nbest_scale=params.nbest_scale,
         )
-        for i in range(encoder_out.size(0)):
-            hyps.append([lexicon.token_table[idx] for idx in hyp_tokens[i]])
+        for hyp in sp.decode(hyp_tokens):
+            hyps.append(sp.text2word(hyp))
     elif params.decoding_method == "fast_beam_search_nbest_oracle":
         hyp_tokens = fast_beam_search_nbest_oracle(
             model=model,
@@ -377,19 +379,19 @@ def decode_one_batch(
             max_contexts=params.max_contexts,
             max_states=params.max_states,
             num_paths=params.num_paths,
-            ref_texts=graph_compiler.texts_to_ids(supervisions["text"]),
+            ref_texts=sp.encode(supervisions["text"]),
             nbest_scale=params.nbest_scale,
         )
-        for i in range(encoder_out.size(0)):
-            hyps.append([lexicon.token_table[idx] for idx in hyp_tokens[i]])
+        for hyp in sp.decode(hyp_tokens):
+            hyps.append(sp.text2word(hyp))
     elif params.decoding_method == "greedy_search" and params.max_sym_per_frame == 1:
         hyp_tokens = greedy_search_batch(
             model=model,
             encoder_out=encoder_out,
             encoder_out_lens=encoder_out_lens,
         )
-        for i in range(encoder_out.size(0)):
-            hyps.append([lexicon.token_table[idx] for idx in hyp_tokens[i]])
+        for hyp in sp.decode(hyp_tokens):
+            hyps.append(sp.text2word(hyp))
     elif params.decoding_method == "modified_beam_search":
         hyp_tokens = modified_beam_search(
             model=model,
@@ -397,8 +399,8 @@ def decode_one_batch(
             beam=params.beam_size,
             encoder_out_lens=encoder_out_lens,
         )
-        for i in range(encoder_out.size(0)):
-            hyps.append([lexicon.token_table[idx] for idx in hyp_tokens[i]])
+        for hyp in sp.decode(hyp_tokens):
+            hyps.append(sp.text2word(hyp))
     else:
         batch_size = encoder_out.size(0)
 
@@ -422,7 +424,7 @@ def decode_one_batch(
                 raise ValueError(
                     f"Unsupported decoding method: {params.decoding_method}"
                 )
-            hyps.append([lexicon.token_table[idx] for idx in hyp])
+            hyps.append(sp.text2word(sp.decode(hyp)))
 
     if params.decoding_method == "greedy_search":
         return {"greedy_search": hyps}
@@ -442,8 +444,8 @@ def decode_dataset(
     dl: torch.utils.data.DataLoader,
     params: AttributeDict,
     model: nn.Module,
-    lexicon: Lexicon,
-    graph_compiler: CharCtcTrainingGraphCompiler,
+    sp: Tokenizer,
+    word_table: Optional[k2.SymbolTable] = None,
     decoding_graph: Optional[k2.Fsa] = None,
 ) -> Dict[str, List[Tuple[str, List[str], List[str]]]]:
     """Decode dataset.
@@ -455,6 +457,10 @@ def decode_dataset(
         It is returned by :func:`get_params`.
       model:
         The neural model.
+      sp:
+        The BPE model.
+      word_table:
+        The word symbol table.
       decoding_graph:
         The decoding graph. Can be either a `k2.trivial_graph` or HLG, Used
         only when --decoding_method is fast_beam_search.
@@ -486,9 +492,9 @@ def decode_dataset(
         hyps_dict = decode_one_batch(
             params=params,
             model=model,
-            lexicon=lexicon,
-            graph_compiler=graph_compiler,
+            sp=sp,
             decoding_graph=decoding_graph,
+            word_talbe=word_table,
             batch=batch,
         )
 
@@ -496,7 +502,8 @@ def decode_dataset(
             this_batch = []
             assert len(hyps) == len(texts)
             for cut_id, hyp_words, ref_text in zip(cut_ids, hyps, texts):
-                this_batch.append((cut_id, ref_text, hyp_words))
+                ref_words = sp.text2word(ref_text)
+                this_batch.append((cut_id, ref_words, hyp_words))
 
             results[name].extend(this_batch)
 
@@ -550,7 +557,8 @@ def save_results(
 @torch.no_grad()
 def main():
     parser = get_parser()
-    WenetSpeechAsrDataModule.add_arguments(parser)
+    ReazonSpeechAsrDataModule.add_arguments(parser)
+    Tokenizer.add_arguments(parser)
     args = parser.parse_args()
     args.exp_dir = Path(args.exp_dir)
 
@@ -595,14 +603,12 @@ def main():
 
     logging.info(f"Device: {device}")
 
-    lexicon = Lexicon(params.lang_dir)
-    params.blank_id = lexicon.token_table["<blk>"]
-    params.vocab_size = max(lexicon.tokens) + 1
+    sp = Tokenizer.load(params.lang_dir, params.lang_type)
 
-    graph_compiler = CharCtcTrainingGraphCompiler(
-        lexicon=lexicon,
-        device=device,
-    )
+    # <blk> and <unk> are defined in local/prepare_lang_char.py
+    params.blank_id = sp.piece_to_id("<blk>")
+    params.unk_id = sp.piece_to_id("<unk>")
+    params.vocab_size = sp.get_piece_size()
 
     logging.info(params)
 
@@ -653,27 +659,23 @@ def main():
 
     # we need cut ids to display recognition results.
     args.return_cuts = True
-    wenetspeech = WenetSpeechAsrDataModule(args)
+    reazonspeech = ReazonSpeechAsrDataModule(args)
 
-    dev_cuts = wenetspeech.valid_cuts()
-    dev_dl = wenetspeech.valid_dataloaders(dev_cuts)
+    dev_cuts = reazonspeech.valid_cuts()
+    dev_dl = reazonspeech.valid_dataloaders(dev_cuts)
 
-    test_net_cuts = wenetspeech.test_net_cuts()
-    test_net_dl = wenetspeech.test_dataloaders(test_net_cuts)
+    test_cuts = reazonspeech.test_cuts()
+    test_dl = reazonspeech.test_dataloaders(test_cuts)
 
-    test_meeting_cuts = wenetspeech.test_meeting_cuts()
-    test_meeting_dl = wenetspeech.test_dataloaders(test_meeting_cuts)
-
-    test_sets = ["DEV", "TEST_NET", "TEST_MEETING"]
-    test_dl = [dev_dl, test_net_dl, test_meeting_dl]
+    test_sets = ["dev", "test"]
+    test_dl = [dev_dl, test_dl]
 
     for test_set, test_dl in zip(test_sets, test_dl):
         results_dict = decode_dataset(
             dl=test_dl,
             params=params,
             model=model,
-            lexicon=lexicon,
-            graph_compiler=graph_compiler,
+            sp=sp,
             decoding_graph=decoding_graph,
         )
         save_results(
