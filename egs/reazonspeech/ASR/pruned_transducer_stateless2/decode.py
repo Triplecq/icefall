@@ -603,10 +603,6 @@ def main():
 
     logging.info(f"Device: {device}")
 
-    # debugging
-    print('------------------tokenizer--------------')
-    print(params.lang_dir, params.lang_type)
-
     sp = Tokenizer.load(params.lang_dir, params.lang_type)
 
     # <blk> and <unk> are defined in local/prepare_lang_char.py
