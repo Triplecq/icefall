@@ -29,6 +29,9 @@ class Tokenizer:
     def Load(lang_dir: Path, lang_type="", oov="<unk>"):
 
         if not lang_type:
+            # debugging
+            print('checking lang_type in lang_dir: ', lang_dir)
+            print((lang_dir / "lang_type").exists())
             assert (lang_dir / "lang_type").exists(), "lang_type not specified."
             lang_type = (lang_dir / "lang_type").read_text().strip()
 
