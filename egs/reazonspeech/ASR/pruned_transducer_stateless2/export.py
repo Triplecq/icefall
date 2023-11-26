@@ -126,6 +126,13 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--lang-dir",
+        type=str,
+        default="data/lang_char",
+        help="The lang dir",
+    )
+
+    parser.add_argument(
         "--jit",
         type=str2bool,
         default=False,
