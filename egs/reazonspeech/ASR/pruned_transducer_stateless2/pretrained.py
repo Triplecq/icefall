@@ -65,10 +65,9 @@ from beam_search import (
     greedy_search_batch,
     modified_beam_search,
 )
+from tokenizer import Tokenizer
 from torch.nn.utils.rnn import pad_sequence
 from train import get_params, get_transducer_model
-
-from icefall.lexicon import Lexicon
 
 
 def get_parser():
@@ -199,15 +198,19 @@ def read_sound_files(
 @torch.no_grad()
 def main():
     parser = get_parser()
+    Tokenizer.add_arguments(parser)
     args = parser.parse_args()
 
     params = get_params()
 
     params.update(vars(args))
 
-    lexicon = Lexicon(params.lang_dir)
-    params.blank_id = lexicon.token_table["<blk>"]
-    params.vocab_size = max(lexicon.tokens) + 1
+    sp = Tokenizer.load(params.lang, params.lang_type)
+
+    # <blk> is defined in local/prepare_lang_char.py
+    params.blank_id = sp.piece_to_id("<blk>")
+    params.unk_id = sp.piece_to_id("<unk>")
+    params.vocab_size = sp.get_piece_size()
 
     logging.info(f"{params}")
 
@@ -219,6 +222,9 @@ def main():
 
     logging.info("Creating model")
     model = get_transducer_model(params)
+
+    num_param = sum([p.numel() for p in model.parameters()])
+    logging.info(f"Number of model parameters: {num_param}")
 
     checkpoint = torch.load(args.checkpoint, map_location="cpu")
     model.load_state_dict(checkpoint["model"], strict=False)
@@ -255,16 +261,17 @@ def main():
 
     feature_lengths = torch.tensor(feature_lengths, device=device)
 
-    with torch.no_grad():
-        encoder_out, encoder_out_lens = model.encoder(
-            x=features, x_lens=feature_lengths
-        )
+    encoder_out, encoder_out_lens = model.encoder(x=features, x_lens=feature_lengths)
 
+    num_waves = encoder_out.size(0)
     hyps = []
-    msg = f"Using {params.decoding_method}"
+    msg = f"Using {params.method}"
+    if params.method == "beam_search":
+        msg += f" with beam size {params.beam_size}"
     logging.info(msg)
 
-    if params.decoding_method == "fast_beam_search":
+    if params.method == "fast_beam_search":
+        decoding_graph = k2.trivial_graph(params.vocab_size - 1, device=device)
         hyp_tokens = fast_beam_search_one_best(
             model=model,
             decoding_graph=decoding_graph,
@@ -274,49 +281,47 @@ def main():
             max_contexts=params.max_contexts,
             max_states=params.max_states,
         )
-        for i in range(encoder_out.size(0)):
-            hyps.append([lexicon.token_table[idx] for idx in hyp_tokens[i]])
-    elif params.decoding_method == "greedy_search" and params.max_sym_per_frame == 1:
-        hyp_tokens = greedy_search_batch(
-            model=model,
-            encoder_out=encoder_out,
-            encoder_out_lens=encoder_out_lens,
-        )
-        for i in range(encoder_out.size(0)):
-            hyps.append([lexicon.token_table[idx] for idx in hyp_tokens[i]])
-    elif params.decoding_method == "modified_beam_search":
+        for hyp in sp.decode(hyp_tokens):
+            hyps.append(hyp.split())
+    elif params.method == "modified_beam_search":
         hyp_tokens = modified_beam_search(
             model=model,
             encoder_out=encoder_out,
             encoder_out_lens=encoder_out_lens,
             beam=params.beam_size,
         )
-        for i in range(encoder_out.size(0)):
-            hyps.append([lexicon.token_table[idx] for idx in hyp_tokens[i]])
-    else:
-        batch_size = encoder_out.size(0)
 
-        for i in range(batch_size):
+        for hyp in sp.decode(hyp_tokens):
+            hyps.append(hyp.split())
+    elif params.method == "greedy_search" and params.max_sym_per_frame == 1:
+        hyp_tokens = greedy_search_batch(
+            model=model,
+            encoder_out=encoder_out,
+            encoder_out_lens=encoder_out_lens,
+        )
+        for hyp in sp.decode(hyp_tokens):
+            hyps.append(hyp.split())
+    else:
+        for i in range(num_waves):
             # fmt: off
             encoder_out_i = encoder_out[i:i+1, :encoder_out_lens[i]]
             # fmt: on
-            if params.decoding_method == "greedy_search":
+            if params.method == "greedy_search":
                 hyp = greedy_search(
                     model=model,
                     encoder_out=encoder_out_i,
                     max_sym_per_frame=params.max_sym_per_frame,
                 )
-            elif params.decoding_method == "beam_search":
+            elif params.method == "beam_search":
                 hyp = beam_search(
                     model=model,
                     encoder_out=encoder_out_i,
                     beam=params.beam_size,
                 )
             else:
-                raise ValueError(
-                    f"Unsupported decoding method: {params.decoding_method}"
-                )
-            hyps.append([lexicon.token_table[idx] for idx in hyp])
+                raise ValueError(f"Unsupported method: {params.method}")
+
+            hyps.append(sp.decode(hyp).split())
 
     s = "\n"
     for filename, hyp in zip(params.sound_files, hyps):
