@@ -205,7 +205,7 @@ def main():
 
     params.update(vars(args))
 
-    sp = Tokenizer.load(params.lang, params.lang_type)
+    sp = Tokenizer.load(params.lang_dir, params.lang_type)
 
     # <blk> is defined in local/prepare_lang_char.py
     params.blank_id = sp.piece_to_id("<blk>")
