@@ -265,12 +265,12 @@ def main():
 
     num_waves = encoder_out.size(0)
     hyps = []
-    msg = f"Using {params.method}"
-    if params.method == "beam_search":
+    msg = f"Using {params.decoding_method}"
+    if params.decoding_method == "beam_search":
         msg += f" with beam size {params.beam_size}"
     logging.info(msg)
 
-    if params.method == "fast_beam_search":
+    if params.decoding_method == "fast_beam_search":
         decoding_graph = k2.trivial_graph(params.vocab_size - 1, device=device)
         hyp_tokens = fast_beam_search_one_best(
             model=model,
@@ -283,7 +283,7 @@ def main():
         )
         for hyp in sp.decode(hyp_tokens):
             hyps.append(hyp.split())
-    elif params.method == "modified_beam_search":
+    elif params.decoding_method == "modified_beam_search":
         hyp_tokens = modified_beam_search(
             model=model,
             encoder_out=encoder_out,
@@ -293,7 +293,7 @@ def main():
 
         for hyp in sp.decode(hyp_tokens):
             hyps.append(hyp.split())
-    elif params.method == "greedy_search" and params.max_sym_per_frame == 1:
+    elif params.decoding_method == "greedy_search" and params.max_sym_per_frame == 1:
         hyp_tokens = greedy_search_batch(
             model=model,
             encoder_out=encoder_out,
@@ -306,20 +306,20 @@ def main():
             # fmt: off
             encoder_out_i = encoder_out[i:i+1, :encoder_out_lens[i]]
             # fmt: on
-            if params.method == "greedy_search":
+            if params.decoding_method == "greedy_search":
                 hyp = greedy_search(
                     model=model,
                     encoder_out=encoder_out_i,
                     max_sym_per_frame=params.max_sym_per_frame,
                 )
-            elif params.method == "beam_search":
+            elif params.decoding_method == "beam_search":
                 hyp = beam_search(
                     model=model,
                     encoder_out=encoder_out_i,
                     beam=params.beam_size,
                 )
             else:
-                raise ValueError(f"Unsupported method: {params.method}")
+                raise ValueError(f"Unsupported method: {params.decoding_method}")
 
             hyps.append(sp.decode(hyp).split())
 
