@@ -20,27 +20,54 @@
 # to a single one using model averaging.
 """
 Usage:
+
+(1) Export to torchscript model using torch.jit.script()
+
 ./pruned_transducer_stateless2/export.py \
   --exp-dir ./pruned_transducer_stateless2/exp \
-  --jit 0 \
-  --epoch 29 \
+  --lang data/lang_char \
+  --epoch 26 \
+  --avg 5 \
+  --jit true
+
+It will generate a file `cpu_jit.pt` in the given `exp_dir`. You can later
+load it by `torch.jit.load("cpu_jit.pt")`.
+
+Note `cpu` in the name `cpu_jit.pt` means the parameters when loaded into Python
+are on CPU. You can use `to("cuda")` to move them to a CUDA device.
+
+Please refer to
+https://k2-fsa.github.io/sherpa/python/offline_asr/conformer/index.html
+for how to use `cpu_jit.pt` for speech recognition.
+
+(2) Export `model.state_dict()`
+
+./pruned_transducer_stateless2/export.py \
+  --exp-dir ./pruned_transducer_stateless2/exp \
+  --lang data/lang_char \
+  --epoch 26 \
   --avg 5
 
-It will generate a file exp_dir/pretrained-epoch-29-avg-5.pt
+It will generate a file `pretrained.pt` in the given `exp_dir`. You can later
+load it by `icefall.checkpoint.load_checkpoint()`.
 
 To use the generated file with `pruned_transducer_stateless2/decode.py`,
-you can do::
+you can do:
 
     cd /path/to/exp_dir
-    ln -s pretrained-epoch-29-avg-5.pt epoch-9999.pt
+    ln -s pretrained.pt epoch-9999.pt
 
-    cd /path/to/egs/aishell/ASR
+    cd /path/to/egs/reazonspeech/ASR
     ./pruned_transducer_stateless2/decode.py \
         --exp-dir ./pruned_transducer_stateless2/exp \
         --epoch 9999 \
         --avg 1 \
-        --max-duration 100 \
-        --lang-dir data/lang_char
+        --max-duration 180 \
+        --decoding-method greedy_search \
+        --lang data/lang_char
+
+You can find pretrained models at
+https://huggingface.co/luomingshuang/icefall_asr_wenetspeech_pruned_transducer_stateless2/tree/main/exp
 """
 
 import argparse
@@ -49,6 +76,7 @@ from pathlib import Path
 
 import torch
 from train import add_model_arguments, get_params, get_transducer_model
+from tokenizer import Tokenizer
 
 from icefall.checkpoint import average_checkpoints, find_checkpoints, load_checkpoint
 from icefall.lexicon import Lexicon
@@ -65,7 +93,7 @@ def get_parser():
         type=int,
         default=29,
         help="""It specifies the checkpoint to use for averaging.
-        Note: Epoch counts from 1.
+        Note: Epoch counts from 0.
         You can specify --avg to use more checkpoints for model averaging.""",
     )
 
@@ -90,8 +118,8 @@ def get_parser():
 
     parser.add_argument(
         "--exp-dir",
-        type=Path,
-        default=Path("pruned_transducer_stateless2/exp"),
+        type=str,
+        default="pruned_transducer_stateless2/exp",
         help="""It specifies the directory where all training related
         files, e.g., checkpoints, log, etc, are saved
         """,
@@ -103,13 +131,6 @@ def get_parser():
         default=False,
         help="""True to save a model after applying torch.jit.script.
         """,
-    )
-
-    parser.add_argument(
-        "--lang-dir",
-        type=Path,
-        default=Path("data/lang_char"),
-        help="The lang dir",
     )
 
     parser.add_argument(
@@ -125,7 +146,10 @@ def get_parser():
 
 
 def main():
-    args = get_parser().parse_args()
+    parser = get_parser()
+    Tokenizer.add_arguments(parser)
+    args = parser.parse_args()
+    args.exp_dir = Path(args.exp_dir)
 
     params = get_params()
     params.update(vars(args))
@@ -136,10 +160,11 @@ def main():
 
     logging.info(f"device: {device}")
 
-    lexicon = Lexicon(params.lang_dir)
+    sp = Tokenizer.load(params.lang_dir, params.lang_type)
 
-    params.blank_id = 0
-    params.vocab_size = max(lexicon.tokens) + 1
+    # <blk> is defined in local/prepare_lang_char.py
+    params.blank_id = sp.piece_to_id("<blk>")
+    params.vocab_size = sp.get_piece_size()
 
     logging.info(params)
 
